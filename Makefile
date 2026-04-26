@@ -1,0 +1,43 @@
+CC      = gcc
+CFLAGS  = -Wall -Wextra -g
+
+## macOS needs -lpthread linked explicitly;
+## the semaphore used is the POSIX named sem_open (no -lrt needed on macOS)
+LIBS    = -lpthread
+
+## server
+SERVER_SRCS = server_main_mac.c \
+              server.c          \
+              document.c        \
+              persistence.c     \
+              auth.c
+
+SERVER_OUT  = server
+
+## client
+CLIENT_SRCS = client_main.c \
+              client.c      \
+              terminal_mac.c
+
+CLIENT_OUT  = client
+
+## logger
+LOGGER_SRCS = logger.c
+LOGGER_OUT  = logger
+
+## top-level targets
+.PHONY: all clean
+
+all: $(SERVER_OUT) $(CLIENT_OUT) $(LOGGER_OUT)
+
+$(SERVER_OUT): $(SERVER_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+$(CLIENT_OUT): $(CLIENT_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+$(LOGGER_OUT): $(LOGGER_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^
+
+clean:
+	rm -f $(SERVER_OUT) $(CLIENT_OUT) $(LOGGER_OUT) server.log
