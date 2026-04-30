@@ -27,5 +27,19 @@ A multithreaded, real-time collaborative text editor built entirely in C that ru
 
 ## Setting Up
 
+### Delete one Makefile
 If your system uses macOS then delete the Makefile_linux and use only Makefile_mac.
+
 If your system uses Linux then delete the Makefile_mac and use only Makefile_linux.
+
+### Communication between multiple devices (macOS)
+1. **Find your local IP:** Open your Mac terminal and run `ifconfig` (or `ipconfig getifaddr en0`). Look for an IPv4 address that probably starts with `192.168.` or `10.0.`. Suppose it is `192.168.1.15`.
+2. **Update the Client:** Change the definition in `client.h` to `#define IP "192.168.1.15"`.
+3. **Recompile:** Run `make all` to recompile the client with the new IP address.
+4. **Connect:** Run `./server` on your Mac. Send the compiled `./client` executable to your friend on the same Wi-Fi network. When they run it, their packets will route through your home router directly to your Mac.
+
+### Communication between multiple devices (Linux)
+1. **Find your local IP:** Open your Linux terminal and run `hostname -I`. Look for an IPv4 address that probably starts with `192.168.` or `10.0.`. Suppose it is `192.168.1.15`.
+2. **Update the Client:** Change the definition in `client.h` to `#define IP "192.168.1.15"`.
+3. **Recompile:** Run `make all` to recompile the client with the new IP address.
+4. **Connect:** Run `./server` on your Linux machine. Send the compiled `./client` executable to your friend on the same Wi-Fi network. When they run it, their packets will route through your home router directly to your machine.
