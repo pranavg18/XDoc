@@ -28,9 +28,9 @@ A multithreaded, real-time collaborative text editor built entirely in C that ru
 ## Setting Up
 
 ### Delete one Makefile
-If your system uses macOS then delete the Makefile_linux and use only Makefile_mac.
+If your system uses macOS then run `rm Makefile_linux` folllowed by `mv Makefile_mac Makefile`.
 
-If your system uses Linux then delete the Makefile_mac and use only Makefile_linux.
+If your system uses macOS then run `rm Makefile_mac` folllowed by `mv Makefile_linux Makefile`.
 
 ### Communication between multiple devices (macOS)
 1. **Find your local IP:** Open your Mac terminal and run `ifconfig` (or `ipconfig getifaddr en0`). Look for an IPv4 address that probably starts with `192.168.` or `10.0.`. Suppose it is `192.168.1.15`.
