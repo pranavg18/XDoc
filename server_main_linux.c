@@ -425,10 +425,9 @@ int main() {
     else
         log_event("[Server] FIFO connected to logger.\n");
 
-    sem_unlink("/clientSlots");  // clean up any leftover from a previous crash
-    clientSlots = sem_open("/clientSlots", O_CREAT, 0644, MAX_CLIENTS);
-    if (clientSlots == SEM_FAILED) {
-        perror("sem_open failed");
+    clientSlots = malloc(sizeof(sem_t)); // clean up any leftover from a previous crash
+    if (sem_init(clientSlots, 0, MAX_CLIENTS) == -1) {
+        perror("sem_init failed");
         exit(1);
     }
     log_event("[Server] Client semaphore initialized. Max clients: %d\n", MAX_CLIENTS);
@@ -545,8 +544,8 @@ int main() {
         printf("[Server] Document was last saved by an admin during this session at time %s.\n", buffer);
     }
 
-    sem_close(clientSlots); // close our handle to it
-    sem_unlink("/clientSlots"); // remove it from the OS entirely
+    sem_destroy(clientSlots); // close our handle to it
+    free(clientSlots); // remove it from the OS entirely
     close(serverSocket);
     printf("[Server] Goodbye.\n");
     return 0;

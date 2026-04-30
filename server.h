@@ -10,7 +10,7 @@
 #include "protocol.h"
 
 #define PORT 8080
-#define backlog 3
+#define backlog 3 // waiting queue size
 
 int initialize_server();
 

@@ -1,4 +1,5 @@
 admin:admin123:0
-apps:apps05:0
+apps:apps05:1
 pranav:pranav03:1
 guest:guest:2
+newuser:123:1

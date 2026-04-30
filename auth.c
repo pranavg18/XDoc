@@ -30,3 +30,33 @@ Role authenticate(const char *username, const char *password) {
     fclose(fp);
     return DENIED;  // username not found
 }
+
+Role register_user(const char *username, const char *password) {
+    FILE *fp = fopen(USERS_FILE, "r");
+    if (fp) {
+        char line[128];
+        while (fgets(line, sizeof(line), fp)) {
+            char user[32];
+            sscanf(line, "%31[^:]", user);
+            if (strcmp(username, user) == 0) {
+                fclose(fp);
+                printf("[Auth] Registration failed. Username '%s' already exists.\n", username);
+                return DENIED; // username taken
+            }
+        }
+        fclose(fp);
+    }
+
+    // append the new user to the file
+    fp = fopen(USERS_FILE, "a");
+    if (!fp) {
+        perror("[Auth] Cannot open users file for adding new user");
+        return DENIED;
+    }
+    int role = EDITOR;
+    fprintf(fp, "%s:%s:%d\n", username, password, role);
+    fclose(fp);
+
+    printf("[Auth] Successfully registered new user: '%s'\n", username);
+    return (Role)role;
+}

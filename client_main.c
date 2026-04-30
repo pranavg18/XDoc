@@ -25,6 +25,21 @@ static int login(int networkSocket) {
     AuthRequest req;
     memset(&req, 0, sizeof(req));
 
+    printf("Do you want to Login or Register [L/R]? ");
+    fflush(stdout);
+    char choice[10];
+    if (!fgets(choice, sizeof(choice), stdin))
+        return -1;
+    
+    if (toupper(choice[0]) == 'R') {
+        req.isRegister = 1;
+        printf("NEW ACCOUNT REGISTRATION\n");
+    }
+    else {
+        req.isRegister = 0;
+        printf("SYSTEM LOGIN\n");
+    }
+
     // receive username
     printf("Username: ");
     fflush(stdout);
@@ -79,7 +94,7 @@ void *network_listener(void *arg) {
         int bytes_read = read(networkSocket, &incomingPacket, sizeof(struct Packet));
         if (bytes_read <= 0) { // server crashed or closed connection
             pthread_mutex_lock(&screenLock);
-            printf("\r\n[Network Error] Server disconnected. Press 'q' to exit.\r\n");
+            printf("\r\n[Network Error] Client disconnected. Press Ctrl+Q to exit.\r\n");
             pthread_mutex_unlock(&screenLock);
             exit(0);
         }
@@ -149,7 +164,7 @@ void *network_listener(void *arg) {
 
                 // if someone else types before or at same time
                 if (incomingPacket.userSocket != myID) {
-                    if (incomingPacket.lineNumber == cursorLine && incomingPacket.index <= cursorIndex) {
+                    if (incomingPacket.lineNumber == cursorLine && incomingPacket.index < cursorIndex) {
                         // this client's text moved down to the new line
                         cursorIndex -= incomingPacket.index;
                         cursorLine++;
@@ -162,7 +177,7 @@ void *network_listener(void *arg) {
                 printf("\033[@%c", incomingPacket.character); // ANSI insert command
 
                 // again adjust for another client's character insertion
-                if (incomingPacket.userSocket != myID && incomingPacket.lineNumber == cursorLine && incomingPacket.index <= cursorIndex)
+                if (incomingPacket.userSocket != myID && incomingPacket.lineNumber == cursorLine && incomingPacket.index < cursorIndex)
                     cursorIndex++;
             }
             printf("\033[%d;%dH", cursorLine, cursorIndex + 1); // restore to this client's tracked cursor position
@@ -237,8 +252,12 @@ int main() {
         if (bytes_read <= 0)
             continue;
 
-        // Ctrl+S = ASCII 19
-        if (c == 19) {
+        // quit
+        if (c == 17) // Ctrl+Q = ASCII 17
+            break;
+
+        // save
+        if (c == 19) { // Ctrl+S = ASCII 19
             struct Packet savePacket;
             memset(&savePacket, 0, sizeof(savePacket));
             savePacket.action = SAVE;
@@ -248,10 +267,6 @@ int main() {
             continue;
         }
 
-        // the kill switch
-        if (c == 'q')
-            break;
-        
         if (role == VIEWER) {
             if (c == '\033') {
                 char seq[2];
