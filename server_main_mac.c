@@ -1,7 +1,8 @@
 #include "server.h"
-#include "document.h"
+#include "crdt.h"
 #include "persistence.h"
 #include "auth.h"
+#include "network.h"
 #include "math.h"
 #include <signal.h>
 #include <semaphore.h>
@@ -12,17 +13,24 @@
 
 #define MAX_CLIENTS 10 // semaphore cap
 
+// global document state
+static CRDTDoc* doc;
+static uint32_t g_lamport = 0; // server-side Lamport counter (for sync packets)
+static pthread_mutex_t lamport_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// save state
 static volatile int hasSaved = 0; // set to 1 the first time admin saves
 static volatile long lastSavedTime;
 static pthread_mutex_t saveLock = PTHREAD_MUTEX_INITIALIZER; // guards hasSaved and lastSavedTime
 
-Role clientRoles[100];
-int activeClients[100];
-char clientUsernames[100][32];
-int clientCount = 0;
-pthread_mutex_t clientsLock = PTHREAD_MUTEX_INITIALIZER;
+// client registry
+static Role clientRoles[100];
+static int activeClients[100];
+static char clientUsernames[100][32];
+static int clientCount = 0;
+static pthread_mutex_t clientsLock = PTHREAD_MUTEX_INITIALIZER;
 
-sem_t *clientSlots; // counting semaphore (pointer coz fuck macOS)
+static sem_t *clientSlots; // counting semaphore (pointer coz macOS)
 
 // per-client thread
 typedef struct {
@@ -51,12 +59,12 @@ static void log_event(const char *fmt, ...) {
 // SIGINT
 volatile sig_atomic_t should_shutdown = 0; // read and write atomically from memory
 
-void sigint_handler(int sig) {
+static void sigint_handler(int sig) {
     (void)sig; // remove unused-parameter warning
     should_shutdown = 1; // set the flag
 }
 
-void register_sigint_handler() {
+static void register_sigint_handler() {
     struct sigaction sa;
     sa.sa_handler = sigint_handler;
     sigemptyset(&sa.sa_mask); // don't block any other signals while handling
@@ -68,12 +76,20 @@ void register_sigint_handler() {
     printf("[Server] SIGINT handler registered. Press Ctrl+C to save & shut down.\n");
 }
 
+// helpers
+static uint32_t next_lamport(void) {
+    pthread_mutex_lock(&lamport_lock);
+    uint32_t c = ++g_lamport;
+    pthread_mutex_unlock(&lamport_lock);
+    return c;
+}
+
 // broadcast to all other clients
 static void broadcast(const struct Packet *packet, int excludeSocket) {
     pthread_mutex_lock(&clientsLock);
     for (int i = 0; i < clientCount; i++)
         if (activeClients[i]!= excludeSocket)
-            write(activeClients[i], packet, sizeof(struct Packet));
+            send_packet(activeClients[i], packet);
     pthread_mutex_unlock(&clientsLock);
 }
 
@@ -81,7 +97,7 @@ static void broadcast(const struct Packet *packet, int excludeSocket) {
 static void broadcast_all(const struct Packet *packet) {
     pthread_mutex_lock(&clientsLock);
     for (int i = 0; i < clientCount; i++)
-        write(activeClients[i], packet, sizeof(struct Packet));
+        send_packet(activeClients[i], packet);
     pthread_mutex_unlock(&clientsLock);
 }
 
@@ -89,8 +105,7 @@ static void broadcast_all(const struct Packet *packet) {
 static void remove_client(int clientSocket) {
     pthread_mutex_lock(&clientsLock);
 
-    char leavingUsername[32];
-    leavingUsername[0] = '\0';
+    char leavingUsername[32] = {0};
 
     for (int i = 0; i < clientCount; i++)
         if (activeClients[i] == clientSocket) {
@@ -122,41 +137,26 @@ static void remove_client(int clientSocket) {
 }
 
 static void sync_document_to_client(int clientSocket) {
-    LineNode *newUserNode = documentHead;
-    while (newUserNode) {
-        pthread_mutex_lock(&newUserNode->lock);
-        int len = strlen(newUserNode->text);
-
-        for (int i = 0; i < len; i++) {
-            struct Packet newPacket;
-            newPacket.action = INSERT;
-            newPacket.userSocket = clientSocket;
-            newPacket.timestamp = (long)time(NULL);
-            newPacket.lineNumber = newUserNode->lineNumber;
-            newPacket.index = i;
-            newPacket.character = newUserNode->text[i];
-
-            write(clientSocket, &newPacket, sizeof(struct Packet));
+    pthread_mutex_lock(&doc->lock);
+    CharNode* cur = doc->head->next;
+    while (cur) {
+        if (!cur->deleted) {
+            struct Packet pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.action = INSERT;
+            pkt.userSocket = clientSocket;
+            pkt.timestamp = (long)time(NULL);
+            pkt.id = cur->id;
+            pkt.leftID = cur->leftID;
+            pkt.character = cur->value;
+            send_packet(clientSocket, &pkt);
         }
-
-        if (newUserNode->next) {
-            struct Packet newLinePacket;
-            newLinePacket.action = INSERT;
-            newLinePacket.userSocket = clientSocket;
-            newLinePacket.timestamp = (long)time(NULL);
-            newLinePacket.lineNumber = newUserNode->lineNumber;
-            newLinePacket.index = len;
-            newLinePacket.character = '\n';
-
-            write(clientSocket, &newLinePacket, sizeof(struct Packet));
-        }
-
-        pthread_mutex_unlock(&newUserNode->lock);
-
-        newUserNode = newUserNode->next;
+        cur = cur->next;
     }
+    pthread_mutex_unlock(&doc->lock);
 }
 
+// per-client thread
 void *client_handler(void *arg) {
     ClientInfo *info = (ClientInfo *)arg;
     int clientSocket = info->socket;
@@ -165,248 +165,186 @@ void *client_handler(void *arg) {
     strncpy(username, info->username, 32);
     free(info);
 
-    char buffer[1024];
     while (1) {
-        memset(buffer, 0, sizeof(buffer));
-        int bytes_read = read(clientSocket, buffer, sizeof(buffer)-1);
-        if (bytes_read <= 0) {
-            log_event("Client on socket %d disconnected.\n", clientSocket);
+        struct Packet pkt;
+        int disconnected = 0;
+        if (recv_packet(clientSocket, &pkt, &disconnected) < 0) {
+            if (!disconnected)
+                log_event("Client on socket %d disconnected.\n", clientSocket);
             break;
         }
 
-        // Parse the incoming key stroke
-        int numPackets = bytes_read/sizeof(struct Packet); // no. of structs received
-        struct Packet *incomingPackets = (struct Packet *)buffer; // create array of packets
-        for (int i = 0; i < numPackets; i++) { // loop through every packet in case copy-paste was done
-            struct Packet currentPacket = incomingPackets[i];
-            printf("Action %d: User %d typed '%c' at line %d, index %d\n",
-                    currentPacket.action,
-                    currentPacket.userSocket,
-                    currentPacket.character,
-                    currentPacket.lineNumber,
-                    currentPacket.index);
-            
-            // Find the correct line
-            LineNode *currentLine = documentHead;
-            LineNode *prevLine = NULL;
-            while (currentLine && currentLine->lineNumber != currentPacket.lineNumber) {
-                prevLine = currentLine;
-                currentLine = currentLine->next;
-            }
-            if (currentLine == NULL) { // dynamically build the document
-                while (prevLine->lineNumber < currentPacket.lineNumber) {
-                    // lock the tail of document before modifying its pointers
-                    pthread_mutex_lock(&prevLine->lock);
+        // MOVE: compute new position and echo back to sender
+        if (pkt.action == MOVE) {
+            int cur_line, cur_col;
+            crdt_pos_of(doc, pkt.id, &cur_line, &cur_col);
+            int newLine = cur_line, newCol = cur_col;
 
-                    // check if another thread built this line
-                    if (prevLine->next) {
-                        pthread_mutex_unlock(&prevLine->lock);
-                        prevLine = prevLine->next;
-                        continue;
+            if (pkt.character == 'A') { // UP
+                if (newLine > 1) {
+                    newLine--;
+                    // find the lenght of the target line
+                    char buf[65536];
+                    crdt_render(doc, buf, sizeof(buf));
+                    // walk rendered lines to find length
+                    int l = 1, colMax = 0;
+                    for (char *p = buf; *p; p++) {
+                        if (l == newLine){
+                            if (*p == '\n')
+                                break;
+                            colMax++;
+                        }
+                        if (*p == '\n')
+                            l++;
                     }
-
-                    LineNode *newLine = create_node(prevLine->lineNumber+1, "");
-                    newLine->prev = prevLine;
-                    prevLine->next = newLine;
-                    pthread_mutex_unlock(&prevLine->lock);
-                    prevLine = prevLine->next;
+                    newCol = (newCol < colMax) ? newCol : colMax;
                 }
-                currentLine = prevLine;
             }
-            
-            // Lock the line
-            pthread_mutex_lock(&currentLine->lock);
-
-            // if moving cursor up or down
-            if (currentPacket.action == MOVE) {
-                int newLineNum = currentPacket.lineNumber;
-                int newIndex = currentPacket.index;
-
-                if (currentPacket.character == 'A') { // UP
-                    if (currentLine->prev) {
-                        LineNode *target = currentLine->prev;
-                        newLineNum--;
-
-                        pthread_mutex_lock(&target->lock);
-                        newIndex = min(newIndex, (int)strlen(target->text));
-                        pthread_mutex_unlock(&target->lock);
+            else if (pkt.character == 'B') { // DOWN
+                char buf[65536];
+                crdt_render(doc, buf, sizeof(buf));
+                int totalLines = 1;
+                for (char *p = buf; *p; p++)
+                    if (*p == '\n')
+                        totalLines++;
+                if (newLine < totalLines) {
+                    newLine++;
+                    int l = 1, colMax = 0;
+                    for (char *p = buf; *p; p++) {
+                        if (l == newLine){
+                            if (*p == '\n')
+                                break;
+                            colMax++;
+                        }
+                        if (*p == '\n')
+                            l++;
                     }
+                    newCol = (newCol < colMax) ? newCol : colMax;
                 }
-                else if (currentPacket.character == 'B') { // DOWN
-                    if (currentLine->next) {
-                        LineNode *target = currentLine->next;
-                        newLineNum++;
-
-                        pthread_mutex_lock(&target->lock);
-                        newIndex = min(newIndex, (int)strlen(target->text));
-                        pthread_mutex_unlock(&target->lock);
+            }
+            else if (pkt.character == 'C') { // RIGHT
+                char buf[65536];
+                crdt_render(doc, buf, sizeof(buf));
+                int l = 1, c = 0;
+                for (char *p = buf; *p; p++) {
+                    if (l == cur_line && c == cur_col) {
+                        if (*p == '\n')
+                            newLine++, newCol = 0;
+                        else
+                            newCol++;
+                        break;
                     }
+                    if (*p == '\n')
+                        l++, c = 0;
                     else
-                        newIndex = (int)strlen(currentLine->text);
+                        c++;
                 }
-                else if (currentPacket.character == 'C') { // RIGHT
-                    int curLen = strlen(currentLine->text);
-                    if (newIndex < curLen)
-                        newIndex++;
-                    else if (currentLine->next) {
-                        newLineNum++;
-                        newIndex = 0;
+            }
+            else if (pkt.character == 'D') { // LEFT
+                if (newCol > 0)
+                    newCol--;
+                else if (newLine > 1) {
+                    newLine--;
+                    char buf[65536];
+                    crdt_render(doc, buf, sizeof(buf));
+                    int l = 1, colEnd = 0;
+                    for (char *p = buf; *p; p++) {
+                        if (l == newLine && *p == '\n') {
+                            colEnd = cur_col;
+                            break;
+                        }
+                        if (*p == '\n') {
+                            if (l == newLine) {
+                                colEnd = cur_col;
+                                break;
+                            }
+                            l++, cur_col = 0;
+                        }
+                        else if (l == newLine)
+                            cur_col++;
                     }
+                    newCol = colEnd;
                 }
-                else if (currentPacket.character == 'D') { // LEFT
-                    if (newIndex > 0)
-                        newIndex--;
-                    else if (currentLine->prev) {
-                        newLineNum--;
-                        LineNode *prevLine = currentLine->prev;
-                        pthread_mutex_lock(&prevLine->lock);
-                        newIndex = strlen(prevLine->text);
-                        pthread_mutex_unlock(&prevLine->lock);
-                    }
-                }
+            }
 
-                pthread_mutex_unlock(&currentLine->lock);
+            // find the node at the new position to use as the new anchor
+            CharNode* newAnchor = crdt_node_at(doc, newLine, newCol);
+            struct Packet reply;
+            memset(&reply, 0, sizeof(reply));
+            reply.action = MOVE;
+            reply.userSocket = pkt.userSocket;
+            reply.timestamp = (long)time(NULL);
+            reply.id = newAnchor->id;
+            reply.character = pkt.character;
+            send_packet(clientSocket, &reply);
+            continue;
+        }
+        // SAVE
+        if (pkt.action == SAVE) {
+            struct Packet reply;
+            memset(&reply, 0, sizeof(reply));
+            reply.action = SAVE;
+            reply.userSocket = clientSocket;
+            reply.timestamp = (long)time(NULL);
 
-                // send it back to the client who moved the cursor
-                struct Packet moveCursor;
-                moveCursor.action = MOVE;
-                moveCursor.lineNumber = newLineNum;
-                moveCursor.index = newIndex;
-                moveCursor.timestamp = (long)time(NULL);
-                moveCursor.userSocket = currentPacket.userSocket;
-                moveCursor.character = currentPacket.character;
+            if (clientRole != ADMIN) {
+                reply.id.counter = UINT32_MAX; // sentinel for DENIED
+                send_packet(clientSocket, &reply);
+                log_event("[Save] DENIED for socket %d ('%s'): Not Admin.\n", clientSocket, username);
+            }
+            else {
+                pthread_mutex_lock(&lamport_lock);
+                uint32_t snap_counter = g_lamport;
+                pthread_mutex_unlock(&lamport_lock);
+                save_document(doc, DOC_FILE, snap_counter);
+                pthread_mutex_lock(&saveLock);
+                lastSavedTime = (long)time(NULL);
+                hasSaved = 1;
+                pthread_mutex_unlock(&saveLock);
+                reply.id.counter = 0; // sentinel for SUCCESS
+                snprintf(reply.username, 32, "%s", username);
+                broadcast_all(&reply);
+                log_event("[Save] Document saved by admin '%s'.\n", username);
+            }
+            continue;
+        }
+        
+        // DROP edits from viewers
+        if (clientRole == VIEWER)
+            continue;
+        
+        // INSERT
+        if (pkt.action == INSERT) {
+            // advance global Lamport clock to be >= sender's clock
+            pthread_mutex_lock(&lamport_lock);
+            if (pkt.id.counter > g_lamport)
+                g_lamport = pkt.id.counter;
+            g_lamport++;
+            pthread_mutex_unlock(&lamport_lock);
 
-                write(clientSocket, &moveCursor, sizeof(struct Packet));
+            CharNode* inserted = crdt_insert(doc, pkt.leftID, pkt.id, pkt.character);
+            if (!inserted) {
+                log_event("[Server] INSERT failed: leftID not found. socket = %d\n", clientSocket);
                 continue;
             }
 
-            // drop the packets from viewers
-            if (clientRole == VIEWER) {
-                pthread_mutex_unlock(&currentLine->lock);
+            // broadcast to all other clients
+            broadcast(&pkt, clientSocket);
+            log_event("[Edit] INSERT '%c' id = (%u, %u) left = (%u, %u) by '%s'\n", pkt.character, pkt.id.counter, pkt.id.client_id, pkt.leftID.counter, pkt.leftID.client_id, username);
+        }
+
+        // DELETE
+        else if (pkt.action == DELETE) {
+            bool ok = crdt_delete(doc, pkt.id);
+            if (!ok) {
+                log_event("[Server] DELETE failed: ID not found. Socket = %d\n", clientSocket);
                 continue;
             }
-            
-            // Update the text
-            if (currentPacket.action == SAVE) { // admin only
-                struct Packet reply;
-                memset(&reply, 0, sizeof(reply));
-                reply.action = SAVE;
-                reply.userSocket = clientSocket;
-                reply.timestamp = (long)time(NULL);
-
-                pthread_mutex_unlock(&currentLine->lock); // unlock before save_document else it freezes
-
-                if (clientRole != ADMIN) {
-                    reply.index = -1; // DENIED
-                    write(clientSocket, &reply, sizeof(struct Packet));
-                    log_event("[Save] DENIED for socket %d ('%s') - not an admin.\n", clientSocket, username);
-                }
-                else {
-                    save_document(DOC_FILE);
-                    pthread_mutex_lock(&saveLock);
-                    lastSavedTime = (long)time(NULL);
-                    hasSaved = 1;
-                    pthread_mutex_unlock(&saveLock);
-                    reply.index = 0; // SUCCESS
-                    snprintf(reply.username, 32, "%s", username);
-                    broadcast_all(&reply); // everyone gets the confirmation
-                    log_event("[Save] Document saved by admin '%s'.\n", username);
-                }
-                continue;
-            }
-            else if (currentPacket.action == INSERT) { // if inserting a new character
-                if (currentPacket.character == '\n') {
-                    // first split
-                    split_line(currentLine, currentPacket.index);
-
-                    // broadcast it to all clients
-                    broadcast_all(&currentPacket);
-
-                    // redraw the characters that moved to the new line
-                    LineNode *newLine = currentLine->next;
-                    int len = strlen(newLine->text);
-
-                    for (int j = 0; j < len; j++) {
-                        struct Packet redrawPacket;
-                        memset(&redrawPacket, 0, sizeof(redrawPacket));
-                        redrawPacket.action = REDRAW; // clients should not adjust cursor for redraws
-                        redrawPacket.userSocket = currentPacket.userSocket;
-                        redrawPacket.lineNumber = newLine->lineNumber;
-                        redrawPacket.index = j;
-                        redrawPacket.character = newLine->text[j];
-
-                        // broadcast each character
-                        broadcast_all(&redrawPacket);
-                    }
-                    pthread_mutex_unlock(&currentLine->lock);
-                    continue;
-                }
-                else {
-                    int len = strlen(currentLine->text);
-                    if (len >= 255) {
-                        pthread_mutex_unlock(&currentLine->lock);
-                        continue;
-                    }
-                    for (int i = len; i >= currentPacket.index; i--)
-                        currentLine->text[i+1] = currentLine->text[i];
-                    currentLine->text[currentPacket.index] = currentPacket.character;
-                }
-            }
-            else if (currentPacket.action == DELETE) { // if deleting
-                if (currentPacket.index == -1) { // backspace at start of line
-                    LineNode *prevLine = currentLine->prev;
-                    if (!prevLine) {
-                        pthread_mutex_unlock(&currentLine->lock);
-                        continue;
-                    }
-
-                    pthread_mutex_lock(&prevLine->lock);
-                    int prevLen = strlen(prevLine->text);
-
-                    merge_lines(currentLine);
-
-                    // broadcast the merge command
-                    struct Packet merge;
-                    merge.action = DELETE;
-                    merge.userSocket = currentPacket.userSocket;
-                    merge.lineNumber = currentPacket.lineNumber;
-                    merge.index = prevLen;
-                    merge.character = '\n'; // code to pull lines up if newline in delete
-
-                    broadcast_all(&merge);
-
-                    // redraw merged text onto previous line
-                    int newTotalLen = strlen(prevLine->text);
-                    for (int j = prevLen; j < newTotalLen; j++) {
-                        struct Packet redrawPacket;
-                        redrawPacket.action = REDRAW; // clients should not adjust cursor for redraws
-                        redrawPacket.userSocket = currentPacket.userSocket;
-                        redrawPacket.lineNumber = prevLine->lineNumber;
-                        redrawPacket.index = j;
-                        redrawPacket.character = prevLine->text[j];
-
-                        broadcast_all(&redrawPacket);
-                    }
-                    pthread_mutex_unlock(&prevLine->lock);
-                    pthread_mutex_unlock(&currentLine->lock);
-                    free(currentLine);
-                    continue;
-                }
-                else {
-                    int len = strlen(currentLine->text);
-                    if (len > 0 && currentPacket.index < len)
-                        for (int i = currentPacket.index; i <= len; i++)
-                            currentLine->text[i] = currentLine->text[i+1];
-                }
-            }
-
-            // Unlock the line
-            pthread_mutex_unlock(&currentLine->lock);
-
-            // Send the updated line to all other clients
-            broadcast(&currentPacket, clientSocket);
+            broadcast(&pkt, clientSocket);
+            log_event("[Edit] DELETE id = (%u, %u) by '%s'\n", pkt.id.counter, pkt.id.client_id, username);
         }
     }
+
     log_event("Client '%s' (socket %d) disconnected.\n", username, clientSocket);
     remove_client(clientSocket); // release semaphore
     close(clientSocket);
@@ -414,7 +352,8 @@ void *client_handler(void *arg) {
 }
 
 int main() {
-    load_document(DOC_FILE); // load doc from disk
+    doc = crdt_new();
+    load_document(doc, DOC_FILE, &g_lamport); // load doc from disk
     register_sigint_handler(); // SIGINT setup
 
     // open write-end of the FIFO (blocks until logger opens the read-end)
@@ -440,7 +379,8 @@ int main() {
     while (!should_shutdown) {
         // semaphore wait blocks if MAX_CLIENTS already connected
         while (sem_trywait(clientSlots) == -1) {
-            if (should_shutdown) goto shutdown;
+            if (should_shutdown)
+                goto shutdown;
             sleep(1);  // wait 1 second then try again
         }
         
@@ -461,8 +401,8 @@ int main() {
 
         // role-based authentication
         AuthRequest authReq;
-        int authBytes = read(clientSocket, &authReq, sizeof(AuthRequest));
-        if (authBytes != sizeof(AuthRequest)) {
+        ssize_t authBytes = read(clientSocket, &authReq, sizeof(AuthRequest));
+        if (authBytes != (ssize_t)sizeof(AuthRequest)) {
             printf("[Auth] Incomplete auth from socket %d. Closing.\n", clientSocket);
             close(clientSocket);
             sem_post(clientSlots);
@@ -490,10 +430,11 @@ int main() {
         log_event("[Auth] '%s' logged in as %s (socket %d)\n", authReq.username, roleNames[role], clientSocket);
 
         // give the client its ID so it becomes self-aware
-        write(clientSocket, &clientSocket, sizeof(int));
+        write_exact(clientSocket, &clientSocket, sizeof(int));
         sync_document_to_client(clientSocket);
 
         pthread_mutex_lock(&clientsLock);
+        
         // add new socket to active clients list
         activeClients[clientCount] = clientSocket;
         clientRoles[clientCount] = role;
@@ -547,6 +488,7 @@ int main() {
 
     sem_close(clientSlots); // close our handle to it
     sem_unlink("/clientSlots"); // remove it from the OS entirely
+    crdt_free(doc);
     close(serverSocket);
     printf("[Server] Goodbye.\n");
     return 0;

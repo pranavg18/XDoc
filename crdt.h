@@ -36,7 +36,7 @@ typedef struct MapEntry {
 
 // Document state is a flat doubly-linked list with a hash map
 typedef struct {
-    CharNode* head; // sentinel head node (id = {0, 0}, value = '\0')
+    CharNode* head; // sentinel head node (id = {0, 0}, value = 0)
     MapEntry* map[CRDT_MAP_BUCKETS];
     pthread_mutex_t lock;
 } CRDTDoc;

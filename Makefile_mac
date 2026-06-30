@@ -1,13 +1,14 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -g
+CFLAGS  = -Wall -Wextra -g -std=c11
 
 LIBS    = -lpthread
 
 ## server
 SERVER_SRCS = server_main_mac.c \
               server.c          \
-              document.c        \
+              crdt.c            \
               persistence.c     \
+              network.c         \
               auth.c
 
 SERVER_OUT  = server
@@ -15,6 +16,8 @@ SERVER_OUT  = server
 ## client
 CLIENT_SRCS = client_main.c \
               client.c      \
+              crdt.c        \
+              network.c     \
               terminal_mac.c
 
 CLIENT_OUT  = client
@@ -23,8 +26,11 @@ CLIENT_OUT  = client
 LOGGER_SRCS = logger.c
 LOGGER_OUT  = logger
 
-## top-level targets
-.PHONY: all clean
+## convergence test (standalone — no networking)
+TEST_SRCS = crdt_test.c crdt.c
+TEST_OUT  = crdt_test
+
+.PHONY: all clean test
 
 all: $(SERVER_OUT) $(CLIENT_OUT) $(LOGGER_OUT)
 
@@ -37,5 +43,15 @@ $(CLIENT_OUT): $(CLIENT_SRCS)
 $(LOGGER_OUT): $(LOGGER_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+test: $(TEST_OUT)
+	./$(TEST_OUT)
+
+$(TEST_OUT): $(TEST_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+tsan: $(TEST_SRCS)
+	$(CC) $(CFLAGS) -fsanitize=thread -o crdt_test_tsan $^ $(LIBS)
+	./crdt_test_tsan
+
 clean:
-	rm -f $(SERVER_OUT) $(CLIENT_OUT) $(LOGGER_OUT) server.log
+	rm -f $(SERVER_OUT) $(CLIENT_OUT) $(LOGGER_OUT) $(TEST_OUT) crdt_test_tsan server.log document.bin

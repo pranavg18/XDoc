@@ -1,4 +1,24 @@
 #include "persistence.h"
+#include <errno.h>
+
+// On-disk record layout
+typedef struct __attribute__((packed)) {
+    uint32_t counter;
+    uint16_t client_id;
+    uint32_t left_counter;
+    uint16_t left_client_id;
+    char value;
+    uint8_t deleted;
+} DiskRecord;
+
+// header at the very start of the file
+typedef struct __attribute__((packed)) {
+    uint32_t magic; // 0xCRDT1234
+    uint32_t max_counter; // highest Lamport counter seen
+    uint32_t num_records;
+} DiskHeader;
+
+#define DISK_MAGIC 0xCDEF1234u
 
 static void fcntl_lock(int fd, short lockType) {
     struct flock fl;
@@ -25,11 +45,12 @@ static void fcntl_unlock(int fd) {
         perror("[Persistence] fcntl unlock failed");
 }
 
-void load_document(const char *filename) {
+void load_document(CRDTDoc* doc, const char *filename, uint32_t* max_counter) {
+    *max_counter = 0;
+
     int fd = open(filename, O_RDONLY);
     if (fd == -1) { // file doesn't exist so start with a blank document
         printf("[Persistence] No existing document found. Starting fresh.\n");
-        init_document();
         return;
     }
 
@@ -37,43 +58,39 @@ void load_document(const char *filename) {
     fcntl_lock(fd, F_RDLCK);
     printf("[Persistence] Read lock acquired on '%s'\n", filename);
 
-    FILE *fp = fdopen(fd, "r"); // allows us to use fgets later
-    if (!fp) {
-        perror("[Persistence] fdopen failed");
+    DiskHeader hdr;
+    if (read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) || hdr.magic != DISK_MAGIC) {
+        fprintf(stderr, "[Persistence] Corrupt or empty document file. Starting fresh.\n");
         fcntl_unlock(fd);
         close(fd);
-        init_document();
         return;
     }
-    
-    LineNode *tail = NULL;
-    char line[256];
-    int lineNum = 1;
+    *max_counter = hdr.max_counter;
 
-    while (fgets(line, sizeof(line), fp)) {
-        int len = strlen(line);
-        if (len > 0 && line[len-1] == '\n')
-            line[len-1] = '\0';
-        LineNode *node = create_node(lineNum, line);
-        if (tail == NULL)
-            documentHead = node;
-        else {
-            tail->next = node;
-            node->prev = tail;
+    for (uint32_t i = 0; i < hdr.num_records; i++) {
+        DiskRecord rec;
+        if (read(fd, &rec, sizeof(rec)) != (ssize_t)sizeof(rec)) {
+            fprintf(stderr, "[Persistence] Truncated record at index %u. Stopping.\n", i);
+            break;
         }
-        tail = node;
-        lineNum++;
-    }
+        ID newID = {rec.counter, rec.client_id};
+        ID leftID = {rec.left_counter, rec.left_client_id};
 
-    if (documentHead == NULL) // we still need 1 node if file was completely empty
-        init_document();
-    
+        // replay the insert into the CRDT
+        CharNode* n = crdt_insert(doc, leftID, newID, rec.value);
+        if (!n) {
+            fprintf(stderr, "[Persistence] WARNING: Could not replay record %u (leftID not found).\n", i);
+            continue;
+        }
+        if (rec.deleted)
+            crdt_delete(doc, newID);
+    }
     fcntl_unlock(fd);
-    fclose(fp);
-    printf("[Persistence] Document loaded from '%s' (%d lines).\n", filename, lineNum - 1);
+    fclose(fd);
+    printf("[Persistence] Document loaded from '%s' (max_counter = %u).\n", filename, *max_counter);
 }
 
-void save_document(const char *filename) {
+void save_document(CRDTDoc* doc, const char *filename, uint32_t max_counter) {
     // open for writing, create if missing, truncate if existing
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd == -1) {
@@ -84,21 +101,36 @@ void save_document(const char *filename) {
     fcntl_lock(fd, F_WRLCK);
     printf("[Persistence] Write lock acquired on '%s'\n", filename);
 
-    LineNode *node = documentHead;
-    while (node) {
-        // lock the line node so no client thread modifies it mid-save
-        pthread_mutex_lock(&node->lock);
-
-        int len = strlen(node->text);
-        if (len > 0)
-            write(fd, node->text, len);
-        write(fd, "\n", 1);
-
-        pthread_mutex_unlock(&node->lock);
-        node = node->next;
+    // count records first (skip sentinel)
+    pthread_mutex_lock(&doc->lock);
+    uint32_t num_records = 0;
+    CharNode* cur = doc->head->next;
+    while (cur) {
+        num_records++;
+        cur = cur->next;
     }
+
+    DiskHeader hdr;
+    hdr.magic = DISK_MAGIC;
+    hdr.max_counter = max_counter;
+    hdr.num_records = num_records;
+    write(fd, &hdr, sizeof(hdr));
+
+    cur = doc->head->next;
+    while (cur) {
+        DiskRecord rec;
+        rec.counter = cur->id.counter;
+        rec.client_id = cur->id.client_id;
+        rec.left_counter = cur->leftID.counter;
+        rec.left_client_id = cur->leftID.client_id;
+        rec.value = cur->value;
+        rec.deleted = (uint8_t)cur->deleted;
+        write(fd, &rec, sizeof(rec));
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&doc->lock);
 
     fcntl_unlock(fd);
     close(fd);
-    printf("[Persistence] Document saved to '%s'.\n", filename);
+    printf("[Persistence] Document saved to '%s' (%u records).\n", filename, num_records);
 }

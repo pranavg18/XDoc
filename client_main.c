@@ -1,27 +1,69 @@
 #include "client.h"
 #include "terminal.h"
 #include "auth.h"
+#include "crdt.h"
+#include "network.h"
 #include "math.h"
 #include <stdint.h>
 #include <ctype.h>
 #include <pthread.h>
 
 /*
-Client has 2 threads running simultaneously:
-1. The Keyboard Thread (main): wants to call printf every time you press a key
-2. The Network Thread (listener): wants to call printf every time someone else presses a key
-So we need a global screenLock so keyboard and network threads don't collide
+Client keeps a full local CRDT replica. Every incoming INSERT/DELETE from the server is applied to this
+replica so the client can compute accurate cursor positions even during concurrent edits.
 */
 
 pthread_mutex_t screenLock = PTHREAD_MUTEX_INITIALIZER; // shortcut to initialize mutex without needing a separate function call
 
-int cursorLine = 1;
-int cursorIndex = 0;
-int myID = -1;
+static CRDTDoc* doc;
+static uint32_t g_lamport = 0; // local Lamport clock
+static pthread_mutex_t lamportLock = PTHREAD_MUTEX_INITIALIZER;
 
-Role role = VIEWER;
+/*
+Cursor is anchored to the ID of the character immediately to the left.
+{0, 0} means the cursor is at the very start of the document
+*/
+static ID cursor_anchor = {0, 0};
+static int myID = -1;
+static Role role = VIEWER;
 
-static int login(int networkSocket) {
+// Lamport helpers
+static uint32_t local_tick() {
+    pthread_mutex_lock(&lamportLock);
+    uint32_t c = ++g_lamport;
+    pthread_mutex_unlock(&lamportLock);
+    return c;
+}
+
+static void update_lamport(uint32_t remote) {
+    pthread_mutex_lock(&lamportLock);
+    if (remote > g_lamport)
+        g_lamport = remote;
+    g_lamport++;
+    pthread_mutex_unlock(&g_lamport);
+}
+
+// Full-screen redraw
+static void redraw_screen() {
+    // render the CRDT to a text buffer
+    char buf[65536];
+    crdt_render(doc, buf, sizeof(buf));
+
+    // compute the cursor's screen position from its anchor ID
+    int curLine, curCol;
+    crdt_pos_of(doc, cursor_anchor, &curLine, &curCol);
+    curCol++; // cursor is after the anchor
+    if (curCol < 1) curCol = 1;
+    printf("\033[2J\033[H"); // clear screen and home
+    printf("%s", buf);
+
+    // restore cursor
+    printf("\033[%d;%dH", curLine, curCol);
+    fflush(stdout);
+}
+
+// Login
+static int login(int fd) {
     AuthRequest req;
     memset(&req, 0, sizeof(req));
 
@@ -63,11 +105,11 @@ static int login(int networkSocket) {
     printf("\n");
 
     // send credentials
-    write(networkSocket, &req, sizeof(AuthRequest));
+    write_exact(fd, &req, sizeof(AuthRequest));
 
     // receive role
     uint8_t roleReply;
-    if (read(networkSocket, &roleReply, sizeof(uint8_t)) != sizeof(uint8_t))
+    if (read_exact(fd, &roleReply, sizeof(uint8_t)) != sizeof(uint8_t))
         return -1;
     role = (Role)roleReply;
 
@@ -85,167 +127,100 @@ static int login(int networkSocket) {
     return 0;
 }
 
+// network listener thread
 void *network_listener(void *arg) {
-    int networkSocket = *(int *)arg;
+    int fd = *(int *)arg;
     struct Packet incomingPacket;
 
     while (1) {
-        // block until server sends an update
-        int bytes_read = read(networkSocket, &incomingPacket, sizeof(struct Packet));
-        if (bytes_read <= 0) { // server crashed or closed connection
+        int dc = 0;
+        if (recv_packet(fd, &incomingPacket, &dc) < 0) {
             pthread_mutex_lock(&screenLock);
-            printf("\r\n[Network Error] Client disconnected. Press Ctrl+Q to exit.\r\n");
+            printf("\r\n[Network Error] Disconnected. Press Ctrl+Q to exit.\r\n");
             pthread_mutex_unlock(&screenLock);
             exit(0);
         }
-
-        if (incomingPacket.action == SAVE) {
-            pthread_mutex_lock(&screenLock);
-            printf("\033[s"); // save cursor
-            printf("\033[999;1H\r\033[K"); // jump to bottom and clear line
-            if (incomingPacket.index == -1) // not an admin
-                printf("[!] Save denied: only ADMIN can save.");
-            else
-                printf("[!] Saved by '%s'.", incomingPacket.username);
-            printf("\033[u"); // restore cursor
-            fflush(stdout);
-            pthread_mutex_unlock(&screenLock);
-            continue;
-        }
-
-        if (incomingPacket.action == JOIN) {
-            pthread_mutex_lock(&screenLock);
-            printf("\033[s");
-            printf("\033[999;1H\r\033[K");
-            printf("[+] '%s' joined the doc.", incomingPacket.username);
-            printf("\033[u");
-            fflush(stdout);
-            pthread_mutex_unlock(&screenLock);
-            continue;
-        }
-
-        if (incomingPacket.action == LEAVE) {
-            pthread_mutex_lock(&screenLock);
-            printf("\033[s");
-            printf("\033[999;1H\r\033[K");
-            printf("[-] '%s' left the doc.", incomingPacket.username);
-            printf("\033[u");
-            fflush(stdout);
-            pthread_mutex_unlock(&screenLock);
-            continue;
-        }
-
-        if (incomingPacket.action == REDRAW) {
-            pthread_mutex_lock(&screenLock);
-            printf("\033[%d;%dH", incomingPacket.lineNumber, incomingPacket.index + 1);
-            printf("%c", incomingPacket.character);
-            printf("\033[%d;%dH", cursorLine, cursorIndex + 1); // restore cursor
-            fflush(stdout);
-            pthread_mutex_unlock(&screenLock);
-            continue;
-        }
-
-        // CRITICAL SECTION
+        update_lamport(incomingPacket.id.counter);
         pthread_mutex_lock(&screenLock);
 
-        // 1. calculate coordinates
-        int row = incomingPacket.lineNumber;
-        int col = incomingPacket.index + 1;
-
-        // 2. teleport to (row, col)
-        printf("\033[%d;%dH", row, col);
-
-        // 3. print the character
-        if (incomingPacket.action == INSERT) {
-            if (incomingPacket.character == '\n') {
-                printf("\033[K"); // erase text in-line
-                printf("\033[%d;1H", row + 1); // move cursor down to the new line
-                printf("\033[L"); // insert a blank row
-
-                // if someone else types before or at same time
-                if (incomingPacket.userSocket != myID) {
-                    if (incomingPacket.lineNumber == cursorLine && incomingPacket.index < cursorIndex) {
-                        // this client's text moved down to the new line
-                        cursorIndex -= incomingPacket.index;
-                        cursorLine++;
-                    }
-                    else if (incomingPacket.lineNumber < cursorLine) // a new line inserted above this client's line
-                        cursorLine++;
-                }
-            }
-            else {
-                printf("\033[@%c", incomingPacket.character); // ANSI insert command
-
-                // again adjust for another client's character insertion
-                if (incomingPacket.userSocket != myID && incomingPacket.lineNumber == cursorLine && incomingPacket.index < cursorIndex)
-                    cursorIndex++;
-            }
-            printf("\033[%d;%dH", cursorLine, cursorIndex + 1); // restore to this client's tracked cursor position
+        if (incomingPacket.action == LEAVE) {
+            printf("\033[s\033[999;1H\r\033[K[-] '%s' left.\033[u", incomingPacket.username);
+            fflush(stdout);
+            pthread_mutex_unlock(&screenLock);
+            continue;
         }
-        else if (incomingPacket.action  == DELETE) {
-            if (incomingPacket.character == '\n') {
-                // teleport to line being deleted
-                printf("\033[%d;1H", incomingPacket.lineNumber);
-                printf("\033[M"); // ANSI delete
+        if (incomingPacket.action == SAVE) {
+            printf("\033[s\033[999;1H\r\033[K");
+            if (incomingPacket.id.counter == UINT32_MAX)
+                printf("[!] SAVE denied: Only ADMIN can save.");
+            else
+                printf("[!] Saved by '%s'.", incomingPacket.username);
+            printf("\033[u");
+            fflush(stdout);
+            pthread_mutex_unlock(&screenLock);
+            continue;
+        }
 
-                // update cursor for the client who pressed backspace
-                if (incomingPacket.userSocket == myID) {
-                    cursorLine = incomingPacket.lineNumber - 1;
-                    cursorIndex = incomingPacket.index;
-                }
-                else { // again adjust for another client's line deletion
-                    if (incomingPacket.lineNumber == cursorLine) {
-                        cursorLine--; // this client's line is being pulled up
-                        cursorIndex += incomingPacket.index;
-                    }
-                    else if (incomingPacket.lineNumber < cursorLine)
-                        cursorLine--; // this client's line is pulled up since a line above was deleted
-                }
-                printf("\033[%d;%dH", cursorLine, cursorIndex + 1); // restore to tracked position
-            }
-            else {
-                printf("\033[P"); // ANSI delete command
-
-                // again adjust for another client's character deletion
-                if (incomingPacket.userSocket != myID && incomingPacket.lineNumber == cursorLine && incomingPacket.index < cursorIndex)
-                    cursorIndex = max(0, cursorIndex - 1);
-                printf("\033[%d;%dH", cursorLine, cursorIndex + 1); // restore to this client's tracked position
-            }
+        // INSERT or DELETE from another client: apply to local CRDT replica
+        if (incomingPacket.action == INSERT) {
+            crdt_insert(doc, incomingPacket.leftID, incomingPacket.id, incomingPacket.character);
+            redraw_screen();
+        }
+        else if (incomingPacket.action == DELETE) {
+            crdt_delete(doc, incomingPacket.id);
+            redraw_screen();
         }
         else if (incomingPacket.action == MOVE) {
-            cursorLine = incomingPacket.lineNumber;
-            cursorIndex = incomingPacket.index;
-            printf("\033[%d;%dH", cursorLine, cursorIndex + 1);
+            // server echoes back our MOVE with the resolved anchor ID
+            cursor_anchor = incomingPacket.id;
+            int cl, cc;
+            crdt_pos_of(doc, cursor_anchor, &cl, &cc);
+            printf("\033[%d;%dH", cl, cc + 1);
+            fflush(stdout);
         }
-
-        // flush buffer
-        fflush(stdout);
-
+        
         pthread_mutex_unlock(&screenLock);
     }
     return NULL;
 }
 
 int main() {
-    int networkSocket = connect_to_server();
+    doc = crdt_new();
 
-    if (login(networkSocket) < 0) {
-        close(networkSocket);
+    int fd = connect_to_server();
+
+    if (login(fd) < 0) {
+        close(fd);
         return 1;
     }
 
-    read(networkSocket, &myID, sizeof(int));
+    read_exact(fd, &myID, sizeof(int));
+    // receive the full document snapshot from the server
+    {
+        // the server sends INSERT packets and then JOIN for the new user, and we read packets until we receive a JOIN packet addressed to us
+        while (1) {
+            struct Packet pkt;
+            int dc = 0;
+            if (recv_packet(fd, &pkt, &dc) < 0)
+                break;
+            if (pkt.action == INSERT)
+                crdt_insert(doc, pkt.leftID, pkt.id, pkt.character);
+            else // received something other than INSERT
+                break;
+        }
+    }
+
     enable_raw_mode();
 
     // Clear the terminal screen to give us a blank canvas
     printf("\033[2J\033[H");
+    redraw_screen();
 
     // spawn the background network listener
     pthread_t listenerThread;
-    pthread_create(&listenerThread, NULL, network_listener, &networkSocket);
+    pthread_create(&listenerThread, NULL, network_listener, &fd);
 
     char c;
-    struct Packet packet;
 
     while (1) {
         int bytes_read = read(STDIN_FILENO, &c, 1);
@@ -263,48 +238,7 @@ int main() {
             savePacket.action = SAVE;
             savePacket.userSocket = myID;
             savePacket.timestamp = (long)time(NULL);
-            write(networkSocket, &savePacket, sizeof(struct Packet));
-            continue;
-        }
-
-        if (role == VIEWER) {
-            if (c == '\033') {
-                char seq[2];
-                if (read(STDIN_FILENO, &seq[0], 1) == 0)
-                    continue;
-                if (read(STDIN_FILENO, &seq[1], 1) == 0)
-                    continue;
-                if (seq[0] == '[') {
-                    packet.action = MOVE;
-                    packet.lineNumber = cursorLine;
-                    packet.index = cursorIndex;
-                    packet.timestamp = (long)time(NULL);
-                    packet.userSocket = myID;
-                    packet.character = seq[1];
-
-                    write(networkSocket, &packet, sizeof(struct Packet));
-                }
-                continue;
-            }
-            continue;
-        }
-        
-        // enter key parser
-        if (c == '\n' || c == '\r') {
-            // build the packet
-            packet.action = INSERT;
-            packet.userSocket = myID;
-            packet.timestamp = (long)time(NULL);
-            packet.lineNumber = cursorLine;
-            packet.index = cursorIndex;
-            packet.character = '\n';
-            
-            // send to the server
-            write(networkSocket, &packet, sizeof(struct Packet));
-
-            cursorLine++;
-            cursorIndex = 0;
-            
+            send_packet(fd, &savePacket);
             continue;
         }
 
@@ -316,81 +250,103 @@ int main() {
             if (read(STDIN_FILENO, &seq[1], 1) == 0)
                 continue;
             if (seq[0] == '[') {
+                struct Packet packet;
+                memset(&packet, 0, sizeof(packet));
                 packet.action = MOVE;
-                packet.lineNumber = cursorLine;
-                packet.index = cursorIndex;
-                packet.timestamp = (long)time(NULL);
                 packet.userSocket = myID;
+                packet.timestamp = (long)time(NULL);
+                packet.id = cursor_anchor; // current anchor
                 packet.character = seq[1];
-
-                write(networkSocket, &packet, sizeof(struct Packet));
+                send_packet(fd, &packet);
             }
+            continue;
+        }
+
+        if (role == VIEWER)
+            continue;
+        
+        // enter key parser
+        if (c == '\n' || c == '\r') {
+            ID newID = {local_tick(), (uint16_t)myID};
+            crdt_insert(doc, cursor_anchor, newID, '\n');
+
+            struct Packet packet;
+            memset(&packet, 0, sizeof(packet));
+            // build the packet
+            packet.action = INSERT;
+            packet.userSocket = myID;
+            packet.timestamp = (long)time(NULL);
+            packet.id = newID;
+            packet.leftID = cursor_anchor;
+            packet.character = '\n';
+            
+            // send to the server
+            send_packet(fd, &packet);
+
+            cursor_anchor = newID;
+
+            pthread_mutex_lock(&screenLock);
+            redraw_screen();
+            pthread_mutex_unlock(&screenLock);
             continue;
         }
 
         // backspace parser
         if (c == 127) {
-            if (cursorIndex > 0) {
-                cursorIndex--;
+            if (!id_eq(cursor_anchor, id_zero())) {
+                // delete the character at cursor_anchor
+                ID toDelete = cursor_anchor;
 
-                // build the delete packet
+                // move anchor to the node before cursor_anchor
+                pthread_mutex_lock(&doc->lock);
+                CharNode* curNode = crdt_find(doc, cursor_anchor);
+                ID newAnchor = curNode && curNode->prev ? curNode->prev->id : id_zero();
+                pthread_mutex_unlock(&doc->lock);
+
+                crdt_delete(doc, toDelete);
+                cursor_anchor = newAnchor;
+
+                struct Packet packet;
+                memset(&packet, 0, sizeof(packet));
                 packet.action = DELETE;
                 packet.userSocket = myID;
                 packet.timestamp = (long)time(NULL);
-                packet.lineNumber = cursorLine;
-                packet.index = cursorIndex;
-                packet.character = '\0'; // don't care for delete
+                packet.id = toDelete;
+                send_packet(fd, &packet);
 
-                write(networkSocket, &packet, sizeof(struct Packet));
-
-                // visually erase it locally
                 pthread_mutex_lock(&screenLock);
-                printf("\033[%d;%dH", cursorLine, cursorIndex + 1);
-                printf("\033[P"); // ANSI delete command
-                fflush(stdout);
-                pthread_mutex_unlock(&screenLock);
-            }
-            else if (cursorLine > 1) {
-                packet.action = DELETE;
-                packet.userSocket = myID;
-                packet.timestamp = (long)time(NULL);
-                packet.lineNumber = cursorLine;
-                packet.index = -1; // code to merge with previous line
-                packet.character = '\0';
-
-                write(networkSocket, &packet, sizeof(struct Packet));
-
-                cursorLine--;
-                pthread_mutex_lock(&screenLock);
-                printf("\033[%d;%dH", cursorLine, cursorIndex + 1);
-                fflush(stdout);
+                redraw_screen();
                 pthread_mutex_unlock(&screenLock);
             }
             continue;
         }
 
-        // build the packet
-        packet.action = INSERT;
-        packet.userSocket = myID;
-        packet.timestamp = (long)time(NULL);
-        packet.lineNumber = cursorLine;
-        packet.index = cursorIndex;
-        packet.character = c;
+        // printable character
+        {
+            ID newID = {local_tick(), (uint16_t)myID};
+            crdt_insert(doc, cursor_anchor, newID, c);
 
-        // blast it to the server
-        write(networkSocket, &packet, sizeof(struct Packet));
+            struct Packet packet;
+            memset(&packet, 0, sizeof(packet));
 
-        // CRITICAL SECTION: DRAWING TO THE SCREEN
-        pthread_mutex_lock(&screenLock); // lock the screen so the network thread doesn't interrupt us
+            // build the packet
+            packet.action = INSERT;
+            packet.userSocket = myID;
+            packet.timestamp = (long)time(NULL);
+            packet.id = newID;
+            packet.leftID = cursor_anchor;
+            packet.character = c;
 
-        printf("\033[%d;%dH", cursorLine, cursorIndex + 1);
-        printf("\033[@%c", c);
-        fflush(stdout);
+            // blast it to the server
+            send_packet(fd, &packet);
 
-        pthread_mutex_unlock(&screenLock);
-
-        cursorIndex++;
+            // CRITICAL SECTION: DRAWING TO THE SCREEN
+            pthread_mutex_lock(&screenLock); // lock the screen so the network thread doesn't interrupt us
+            redraw_screen();
+            pthread_mutex_unlock(&screenLock);
+        }
     }
-    close(networkSocket);
+    close(fd);
+    crdt_free(doc);
     return 0;
 }
