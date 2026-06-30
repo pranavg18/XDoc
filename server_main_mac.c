@@ -168,9 +168,22 @@ void *client_handler(void *arg) {
 
         // MOVE: compute new position and echo back to sender
         if (pkt.action == MOVE) {
-            int cur_line, cur_col;
-            crdt_pos_of(doc, pkt.id, &cur_line, &cur_col);
-            int newLine = cur_line, newCol = cur_col;
+            // compute effective cursor position (0-indexed)
+            int effLine, effCol;
+            if (id_eq(pkt.id, id_zero()))
+                effLine = 1, effCol = 0;
+            else {
+                crdt_pos_of(doc, pkt.id, &effLine, &effCol);
+                pthread_mutex_lock(&doc->lock);
+                CharNode* anchorNode = crdt_find(doc, pkt.id);
+                int isNewLine = anchorNode && (anchorNode->value == '\n');
+                pthread_mutex_unlock(&doc->lock);
+                if (isNewLine)
+                    effLine++, effCol = 0;
+                else
+                    effCol++; // cursor is after the anchor
+            }
+            int newLine = effLine, newCol = effCol;
 
             if (pkt.character == 'A') { // UP
                 if (newLine > 1) {
@@ -219,7 +232,7 @@ void *client_handler(void *arg) {
                 crdt_render(doc, buf, sizeof(buf));
                 int l = 1, c = 0;
                 for (char *p = buf; *p; p++) {
-                    if (l == cur_line && c == cur_col) {
+                    if (l == effLine && c == effCol) {
                         if (*p == '\n')
                             newLine++, newCol = 0;
                         else
@@ -233,29 +246,23 @@ void *client_handler(void *arg) {
                 }
             }
             else if (pkt.character == 'D') { // LEFT
-                if (newCol > 0)
-                    newCol--;
-                else if (newLine > 1) {
-                    newLine--;
+                if (effCol > 0)
+                    newCol = effCol - 1;
+                else if (effLine > 1) {
+                    newLine = effLine - 1;
                     char buf[65536];
                     crdt_render(doc, buf, sizeof(buf));
-                    int l = 1, colEnd = 0;
+                    int l = 1, lineLen = 0;
                     for (char *p = buf; *p; p++) {
-                        if (l == newLine && *p == '\n') {
-                            colEnd = cur_col;
-                            break;
-                        }
                         if (*p == '\n') {
-                            if (l == newLine) {
-                                colEnd = cur_col;
+                            if (l == newLine)
                                 break;
-                            }
-                            l++, cur_col = 0;
+                            l++, lineLen = 0;
                         }
                         else if (l == newLine)
-                            cur_col++;
+                            lineLen++;
                     }
-                    newCol = colEnd;
+                    newCol = lineLen;
                 }
             }
 
@@ -443,6 +450,7 @@ int main() {
         joinPacket.timestamp = (long)time(NULL);
         snprintf(joinPacket.username, 32, "%s", authReq.username);
         broadcast(&joinPacket, clientSocket);
+        send_packet(clientSocket, &joinPacket); // tell the client its own sync is complete
 
         ClientInfo *info = malloc(sizeof(ClientInfo));
         info->socket = clientSocket;

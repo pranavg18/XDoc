@@ -206,6 +206,7 @@ CharNode* crdt_node_at(CRDTDoc* doc, int line, int col) {
 
     int cur_line = 1, cur_col = 0;
     CharNode* result = doc->head; // default: before everything
+    CharNode* lastLive = doc->head; // track last live node
     CharNode* cur = doc->head->next;
 
     while (cur) {
@@ -220,19 +221,28 @@ CharNode* crdt_node_at(CRDTDoc* doc, int line, int col) {
             }
             else
                 cur_col++;
+            lastLive = cur; // update tracker
         }
         cur = cur->next;
     }
 
     // if we exhausted the list at exactly the right position
     if (!cur && cur_line == line && cur_col == col)
-        result = doc->head; // treat as end of document
+        result = lastLive; // use last live node
     pthread_mutex_unlock(&doc->lock);
     return result;
 }
 
 void crdt_pos_of(CRDTDoc* doc, ID anchorID, int* out_line, int* out_col) {
     pthread_mutex_lock(&doc->lock);
+
+    // sentinel means cursor is at the very start
+    if (id_eq(anchorID, id_zero())) {
+        *out_line = 1;
+        *out_col = 0;
+        pthread_mutex_unlock(&doc->lock);
+        return;
+    }
 
     int cur_line = 1, cur_col = 0;
     CharNode* cur = doc->head->next;

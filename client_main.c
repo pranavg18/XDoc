@@ -52,8 +52,26 @@ static void redraw_screen() {
     // compute the cursor's screen position from its anchor ID
     int curLine, curCol;
     crdt_pos_of(doc, cursor_anchor, &curLine, &curCol);
-    curCol++; // cursor is after the anchor
-    if (curCol < 1) curCol = 1;
+
+    // compute effective cursor position based on anchor type
+    if (id_eq(cursor_anchor, id_zero())) {
+        curLine = 1;
+        curCol = 1;
+    }
+    else {
+        // check if anchor is a newline
+        pthread_mutex_lock(&doc->lock);
+        CharNode* anchorNode = crdt_find(doc, cursor_anchor);
+        int isNewLine = anchorNode && (anchorNode->value == '\n');
+        pthread_mutex_unlock(&doc->lock);
+
+        if (isNewLine) {
+            curLine++; // cursor is on the next line
+            curCol = 1; // ANSI 1-indexed
+        }
+        else
+            curCol += 2; // +1 for 0-1 indexed, +1 for "after anchor"
+    }
     printf("\033[2J\033[H"); // clear screen and home
     printf("%s", buf);
 
@@ -300,7 +318,11 @@ int main() {
                 // move anchor to the node before cursor_anchor
                 pthread_mutex_lock(&doc->lock);
                 CharNode* curNode = crdt_find(doc, cursor_anchor);
-                ID newAnchor = curNode && curNode->prev ? curNode->prev->id : id_zero();
+                CharNode* prev = curNode ? curNode->prev : NULL;
+                // skip over tombstoned nodes to find the nearest live predecessor
+                while (prev && prev->deleted)
+                    prev = prev->prev;
+                ID newAnchor = prev ? prev->id : id_zero();
                 pthread_mutex_unlock(&doc->lock);
 
                 crdt_delete(doc, toDelete);
@@ -325,6 +347,7 @@ int main() {
         {
             ID newID = {local_tick(), (uint16_t)myID};
             crdt_insert(doc, cursor_anchor, newID, c);
+            cursor_anchor = newID;
 
             struct Packet packet;
             memset(&packet, 0, sizeof(packet));

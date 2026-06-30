@@ -178,6 +178,7 @@ void *client_handler(void *arg) {
         if (pkt.action == MOVE) {
             int cur_line, cur_col;
             crdt_pos_of(doc, pkt.id, &cur_line, &cur_col);
+            cur_col++; // cursor is after the anchor, not on it
             int newLine = cur_line, newCol = cur_col;
 
             if (pkt.character == 'A') { // UP
@@ -451,6 +452,7 @@ int main() {
         joinPacket.timestamp = (long)time(NULL);
         snprintf(joinPacket.username, 32, "%s", authReq.username);
         broadcast(&joinPacket, clientSocket);
+        send_packet(clientSocket, &joinPacket); // tell the client its own sync is complete
 
         ClientInfo *info = malloc(sizeof(ClientInfo));
         info->socket = clientSocket;
