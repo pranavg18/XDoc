@@ -86,7 +86,7 @@ void load_document(CRDTDoc* doc, const char *filename, uint32_t* max_counter) {
             crdt_delete(doc, newID);
     }
     fcntl_unlock(fd);
-    fclose(fd);
+    close(fd);
     printf("[Persistence] Document loaded from '%s' (max_counter = %u).\n", filename, *max_counter);
 }
 

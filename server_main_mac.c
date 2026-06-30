@@ -76,14 +76,6 @@ static void register_sigint_handler() {
     printf("[Server] SIGINT handler registered. Press Ctrl+C to save & shut down.\n");
 }
 
-// helpers
-static uint32_t next_lamport(void) {
-    pthread_mutex_lock(&lamport_lock);
-    uint32_t c = ++g_lamport;
-    pthread_mutex_unlock(&lamport_lock);
-    return c;
-}
-
 // broadcast to all other clients
 static void broadcast(const struct Packet *packet, int excludeSocket) {
     pthread_mutex_lock(&clientsLock);

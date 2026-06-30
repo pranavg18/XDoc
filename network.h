@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+struct Packet; // forward declaration
+
 // read exactly n bytes from fd into buf
 ssize_t read_exact(int fd, void* buf, size_t n); // returns n on success, 0 on clean close, -1 on error
 

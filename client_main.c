@@ -40,7 +40,7 @@ static void update_lamport(uint32_t remote) {
     if (remote > g_lamport)
         g_lamport = remote;
     g_lamport++;
-    pthread_mutex_unlock(&g_lamport);
+    pthread_mutex_unlock(&lamportLock);
 }
 
 // Full-screen redraw

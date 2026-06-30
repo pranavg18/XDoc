@@ -1,0 +1,18 @@
+
+SESSION STARTED: Wed Jul  1 00:25:37 2026
+[2026-07-01 00:25:37] [Server] FIFO connected to logger.
+[Server] Client semaphore initialized. Max clients: 10
+[Server] Listening on port 8080
+[2026-07-01 00:26:11] [Auth] 'pranav' logged in as EDITOR (socket 6)
+[2026-07-01 00:27:23] [Auth] 'apps' logged in as EDITOR (socket 7)
+[2026-07-01 00:27:26] [Edit] INSERT 'f' id = (1, 6) left = (0, 0) by 'pranav'
+[2026-07-01 00:27:26] [Edit] INSERT 'd' id = (2, 6) left = (0, 0) by 'pranav'
+[2026-07-01 00:27:26] [Edit] INSERT 's' id = (3, 6) left = (0, 0) by 'pranav'
+[2026-07-01 00:27:26] [Edit] INSERT 'a' id = (4, 6) left = (0, 0) by 'pranav'
+[2026-07-01 00:27:26] [Edit] INSERT 'f' id = (5, 6) left = (0, 0) by 'pranav'
+[2026-07-01 00:27:27] [Edit] INSERT 'f' id = (6, 6) left = (0, 0) by 'pranav'
+[2026-07-01 00:27:27] [Edit] INSERT 'd' id = (7, 6) left = (0, 0) by 'pranav'
+[2026-07-01 00:27:27] [Edit] INSERT 's' id = (8, 6) left = (0, 0) by 'pranav'
+[2026-07-01 00:27:29] [Edit] INSERT 'f' id = (12, 6) left = (4, 6) by 'pranav'
+[2026-07-01 00:27:30] [Edit] INSERT 'f' id = (13, 6) left = (4, 6) by 'pranav'
+[2026-07-01 00:27:30] [Edit] INSERT 'f' id = (14, 6) left = (4, 6) by 'pranav'

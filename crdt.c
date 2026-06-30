@@ -1,5 +1,7 @@
 #include "crdt.h"
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 // internal hash-map helpers
 static uint32_t map_hash(ID id) {
