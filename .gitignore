@@ -1,0 +1,7 @@
+*.dSYM/
+client
+server
+logger
+crdt_test
+document.bin
+server.log
