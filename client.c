@@ -1,6 +1,6 @@
 #include "client.h"
 
-int connect_to_server() {
+int connect_to_server(const char* ip_address) {
     int client_fd;
     struct sockaddr_in server_addr;
     client_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -12,7 +12,7 @@ int connect_to_server() {
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
 
-    if (inet_pton(AF_INET, IP, &server_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, ip_address, &server_addr.sin_addr) <= 0) {
         perror("Invalid address or Address not supported");
         exit(1);
     }

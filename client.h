@@ -13,6 +13,6 @@
     #define PORT 8080
     #define IP "127.0.0.1" // localhost for testing
 
-    int connect_to_server();
+    int connect_to_server(const char* ip_address);
 
     #endif

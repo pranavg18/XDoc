@@ -239,10 +239,11 @@ void *network_listener(void *arg) {
     return NULL;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    const char* server_ip = (argc > 1) ? argv[1] : "127.0.0.1";
     doc = crdt_new();
 
-    int fd = connect_to_server();
+    int fd = connect_to_server(server_ip);
 
     if (login(fd) < 0) {
         close(fd);
