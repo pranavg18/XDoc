@@ -43,41 +43,75 @@ static void update_lamport(uint32_t remote) {
     pthread_mutex_unlock(&lamportLock);
 }
 
+// maps a CRDT anchor to an ANSI screen coordinate
+static void set_cursor_from_anchor(CRDTDoc* doc, ID anchor) {
+    int curLine, curCol;
+    crdt_pos_of(doc, anchor, &curLine, &curCol);
+
+    if (id_eq(anchor, id_zero()))
+        curLine = 1, curCol = 1;
+    else {
+        pthread_mutex_lock(&doc->lock);
+        CharNode* anchorNode = crdt_find(doc, anchor);
+        int isNewLine = anchorNode && (anchorNode->value == '\n');
+        int isDeleted = anchorNode && anchorNode->deleted;
+        pthread_mutex_unlock(&doc->lock);
+
+        if (!isDeleted) {
+            if (isNewLine)
+                curLine++, curCol = 1;
+            else
+                curCol += 2; // +1 for 0-index -> 1-index ANSI, +1 for "after" anchor
+        }
+        else
+            curCol++; // just convert to 1-indexed since cursor is already past the deleted char
+    }
+    printf("\033[%d;%dH", curLine, curCol);
+    fflush(stdout);
+}
+
 // Full-screen redraw
 static void redraw_screen() {
     // render the CRDT to a text buffer
     char buf[65536];
     crdt_render(doc, buf, sizeof(buf));
 
-    // compute the cursor's screen position from its anchor ID
-    int curLine, curCol;
-    crdt_pos_of(doc, cursor_anchor, &curLine, &curCol);
-
-    // compute effective cursor position based on anchor type
-    if (id_eq(cursor_anchor, id_zero())) {
-        curLine = 1;
-        curCol = 1;
-    }
-    else {
-        // check if anchor is a newline
-        pthread_mutex_lock(&doc->lock);
-        CharNode* anchorNode = crdt_find(doc, cursor_anchor);
-        int isNewLine = anchorNode && (anchorNode->value == '\n');
-        pthread_mutex_unlock(&doc->lock);
-
-        if (isNewLine) {
-            curLine++; // cursor is on the next line
-            curCol = 1; // ANSI 1-indexed
-        }
-        else
-            curCol += 2; // +1 for 0-1 indexed, +1 for "after anchor"
-    }
     printf("\033[2J\033[H"); // clear screen and home
     printf("%s", buf);
 
-    // restore cursor
-    printf("\033[%d;%dH", curLine, curCol);
-    fflush(stdout);
+    // restore cursor using the helper
+    set_cursor_from_anchor(doc, cursor_anchor);
+
+    // DELETED
+    // // compute the cursor's screen position from its anchor ID
+    // int curLine, curCol;
+    // crdt_pos_of(doc, cursor_anchor, &curLine, &curCol);
+
+    // // compute effective cursor position based on anchor type
+    // if (id_eq(cursor_anchor, id_zero())) {
+    //     curLine = 1;
+    //     curCol = 1;
+    // }
+    // else {
+    //     // check if anchor is a newline
+    //     pthread_mutex_lock(&doc->lock);
+    //     CharNode* anchorNode = crdt_find(doc, cursor_anchor);
+    //     int isNewLine = anchorNode && (anchorNode->value == '\n');
+    //     pthread_mutex_unlock(&doc->lock);
+
+    //     if (isNewLine) {
+    //         curLine++; // cursor is on the next line
+    //         curCol = 1; // ANSI 1-indexed
+    //     }
+    //     else
+    //         curCol += 2; // +1 for 0-1 indexed, +1 for "after anchor"
+    // }
+    // printf("\033[2J\033[H"); // clear screen and home
+    // printf("%s", buf);
+
+    // // restore cursor
+    // printf("\033[%d;%dH", curLine, curCol);
+    // fflush(stdout);
 }
 
 // Login
@@ -191,10 +225,13 @@ void *network_listener(void *arg) {
         else if (incomingPacket.action == MOVE) {
             // server echoes back our MOVE with the resolved anchor ID
             cursor_anchor = incomingPacket.id;
-            int cl, cc;
-            crdt_pos_of(doc, cursor_anchor, &cl, &cc);
-            printf("\033[%d;%dH", cl, cc + 1);
-            fflush(stdout);
+            set_cursor_from_anchor(doc, cursor_anchor);
+            // DELETE
+
+            // int cl, cc;
+            // crdt_pos_of(doc, cursor_anchor, &cl, &cc);
+            // printf("\033[%d;%dH", cl, cc + 1);
+            // fflush(stdout);
         }
         
         pthread_mutex_unlock(&screenLock);
@@ -346,6 +383,8 @@ int main() {
         // printable character
         {
             ID newID = {local_tick(), (uint16_t)myID};
+            ID oldAnchor = cursor_anchor; // save the old anchor
+
             crdt_insert(doc, cursor_anchor, newID, c);
             cursor_anchor = newID;
 
@@ -357,7 +396,7 @@ int main() {
             packet.userSocket = myID;
             packet.timestamp = (long)time(NULL);
             packet.id = newID;
-            packet.leftID = cursor_anchor;
+            packet.leftID = oldAnchor;
             packet.character = c;
 
             // blast it to the server

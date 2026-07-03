@@ -177,11 +177,14 @@ void *client_handler(void *arg) {
                 pthread_mutex_lock(&doc->lock);
                 CharNode* anchorNode = crdt_find(doc, pkt.id);
                 int isNewLine = anchorNode && (anchorNode->value == '\n');
+                int isDeleted = anchorNode && anchorNode->deleted;
                 pthread_mutex_unlock(&doc->lock);
-                if (isNewLine)
-                    effLine++, effCol = 0;
-                else
-                    effCol++; // cursor is after the anchor
+                if (!isDeleted) {
+                    if (isNewLine)
+                        effLine++, effCol = 0;
+                    else
+                        effCol++; // cursor is after the anchor
+                }
             }
             int newLine = effLine, newCol = effCol;
 
