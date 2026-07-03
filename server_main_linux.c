@@ -30,7 +30,7 @@ static char clientUsernames[100][32];
 static int clientCount = 0;
 static pthread_mutex_t clientsLock = PTHREAD_MUTEX_INITIALIZER;
 
-static sem_t *clientSlots; // counting semaphore (pointer for heap allocation)
+static sem_t clientSlots; // counting semaphore (unnamed for Linux)
 
 // per-client thread
 typedef struct {
@@ -74,14 +74,6 @@ static void register_sigint_handler() {
         exit(1);
     }
     printf("[Server] SIGINT handler registered. Press Ctrl+C to save & shut down.\n");
-}
-
-// helpers
-static uint32_t next_lamport(void) {
-    pthread_mutex_lock(&lamport_lock);
-    uint32_t c = ++g_lamport;
-    pthread_mutex_unlock(&lamport_lock);
-    return c;
 }
 
 // broadcast to all other clients
@@ -133,7 +125,7 @@ static void remove_client(int clientSocket) {
         broadcast(&leavePacket, clientSocket);
     }
 
-    sem_post(clientSlots); // release the semaphore slot
+    sem_post(&clientSlots); // release the semaphore slot
 }
 
 static void sync_document_to_client(int clientSocket) {
@@ -176,10 +168,25 @@ void *client_handler(void *arg) {
 
         // MOVE: compute new position and echo back to sender
         if (pkt.action == MOVE) {
-            int cur_line, cur_col;
-            crdt_pos_of(doc, pkt.id, &cur_line, &cur_col);
-            cur_col++; // cursor is after the anchor, not on it
-            int newLine = cur_line, newCol = cur_col;
+            // compute effective cursor position (0-indexed)
+            int effLine, effCol;
+            if (id_eq(pkt.id, id_zero()))
+                effLine = 1, effCol = 0;
+            else {
+                crdt_pos_of(doc, pkt.id, &effLine, &effCol);
+                pthread_mutex_lock(&doc->lock);
+                CharNode* anchorNode = crdt_find(doc, pkt.id);
+                int isNewLine = anchorNode && (anchorNode->value == '\n');
+                int isDeleted = anchorNode && anchorNode->deleted;
+                pthread_mutex_unlock(&doc->lock);
+                if (!isDeleted) {
+                    if (isNewLine)
+                        effLine++, effCol = 0;
+                    else
+                        effCol++; // cursor is after the anchor
+                }
+            }
+            int newLine = effLine, newCol = effCol;
 
             if (pkt.character == 'A') { // UP
                 if (newLine > 1) {
@@ -228,7 +235,7 @@ void *client_handler(void *arg) {
                 crdt_render(doc, buf, sizeof(buf));
                 int l = 1, c = 0;
                 for (char *p = buf; *p; p++) {
-                    if (l == cur_line && c == cur_col) {
+                    if (l == effLine && c == effCol) {
                         if (*p == '\n')
                             newLine++, newCol = 0;
                         else
@@ -242,29 +249,23 @@ void *client_handler(void *arg) {
                 }
             }
             else if (pkt.character == 'D') { // LEFT
-                if (newCol > 0)
-                    newCol--;
-                else if (newLine > 1) {
-                    newLine--;
+                if (effCol > 0)
+                    newCol = effCol - 1;
+                else if (effLine > 1) {
+                    newLine = effLine - 1;
                     char buf[65536];
                     crdt_render(doc, buf, sizeof(buf));
-                    int l = 1, colEnd = 0;
+                    int l = 1, lineLen = 0;
                     for (char *p = buf; *p; p++) {
-                        if (l == newLine && *p == '\n') {
-                            colEnd = cur_col;
-                            break;
-                        }
                         if (*p == '\n') {
-                            if (l == newLine) {
-                                colEnd = cur_col;
+                            if (l == newLine)
                                 break;
-                            }
-                            l++, cur_col = 0;
+                            l++, lineLen = 0;
                         }
                         else if (l == newLine)
-                            cur_col++;
+                            lineLen++;
                     }
-                    newCol = colEnd;
+                    newCol = lineLen;
                 }
             }
 
@@ -365,9 +366,7 @@ int main() {
     else
         log_event("[Server] FIFO connected to logger.\n");
 
-    // LINUX: use anonymous semaphore via sem_init (not named sem_open)
-    clientSlots = malloc(sizeof(sem_t));
-    if (sem_init(clientSlots, 0, MAX_CLIENTS) == -1) {
+    if (sem_init(&clientSlots, 0, MAX_CLIENTS) < 0) {
         perror("sem_init failed");
         exit(1);
     }
@@ -379,7 +378,7 @@ int main() {
     
     while (!should_shutdown) {
         // semaphore wait blocks if MAX_CLIENTS already connected
-        while (sem_trywait(clientSlots) == -1) {
+        while (sem_trywait(&clientSlots) == -1) {
             if (should_shutdown)
                 goto shutdown;
             sleep(1);  // wait 1 second then try again
@@ -392,7 +391,7 @@ int main() {
 
         int clientSocket = accept(serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
         if (clientSocket < 0) {
-            sem_post(clientSlots);
+            sem_post(&clientSlots);
             if (should_shutdown)
                 break;
             perror("Accept failed");
@@ -406,7 +405,7 @@ int main() {
         if (authBytes != (ssize_t)sizeof(AuthRequest)) {
             printf("[Auth] Incomplete auth from socket %d. Closing.\n", clientSocket);
             close(clientSocket);
-            sem_post(clientSlots);
+            sem_post(&clientSlots);
             continue;
         }
 
@@ -423,7 +422,7 @@ int main() {
         if (role == DENIED) {
             printf("[Auth] Login DENIED for '%s'\n", authReq.username);
             close(clientSocket);
-            sem_post(clientSlots);
+            sem_post(&clientSlots);
             continue;
         }
 
@@ -488,9 +487,8 @@ int main() {
         printf("[Server] Document was last saved by an admin during this session at time %s.\n", buffer);
     }
 
-    // LINUX: destroy anonymous semaphore and free heap memory
-    sem_destroy(clientSlots);
-    free(clientSlots);
+    // destroy anonymous semaphore and free heap memory
+    sem_destroy(&clientSlots);
     crdt_free(doc);
     close(serverSocket);
     printf("[Server] Goodbye.\n");

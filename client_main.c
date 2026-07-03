@@ -81,37 +81,6 @@ static void redraw_screen() {
 
     // restore cursor using the helper
     set_cursor_from_anchor(doc, cursor_anchor);
-
-    // DELETED
-    // // compute the cursor's screen position from its anchor ID
-    // int curLine, curCol;
-    // crdt_pos_of(doc, cursor_anchor, &curLine, &curCol);
-
-    // // compute effective cursor position based on anchor type
-    // if (id_eq(cursor_anchor, id_zero())) {
-    //     curLine = 1;
-    //     curCol = 1;
-    // }
-    // else {
-    //     // check if anchor is a newline
-    //     pthread_mutex_lock(&doc->lock);
-    //     CharNode* anchorNode = crdt_find(doc, cursor_anchor);
-    //     int isNewLine = anchorNode && (anchorNode->value == '\n');
-    //     pthread_mutex_unlock(&doc->lock);
-
-    //     if (isNewLine) {
-    //         curLine++; // cursor is on the next line
-    //         curCol = 1; // ANSI 1-indexed
-    //     }
-    //     else
-    //         curCol += 2; // +1 for 0-1 indexed, +1 for "after anchor"
-    // }
-    // printf("\033[2J\033[H"); // clear screen and home
-    // printf("%s", buf);
-
-    // // restore cursor
-    // printf("\033[%d;%dH", curLine, curCol);
-    // fflush(stdout);
 }
 
 // Login
@@ -226,12 +195,6 @@ void *network_listener(void *arg) {
             // server echoes back our MOVE with the resolved anchor ID
             cursor_anchor = incomingPacket.id;
             set_cursor_from_anchor(doc, cursor_anchor);
-            // DELETE
-
-            // int cl, cc;
-            // crdt_pos_of(doc, cursor_anchor, &cl, &cc);
-            // printf("\033[%d;%dH", cl, cc + 1);
-            // fflush(stdout);
         }
         
         pthread_mutex_unlock(&screenLock);
