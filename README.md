@@ -38,3 +38,9 @@ If your system uses macOS then run `rm Makefile_mac` followed by `mv Makefile_li
 3. **Connect a Client:** Send the compiled `./client` executable to a friend on the same Wi-Fi network (or run it yourself on a different machine). To connect it to the server, simply pass the server's IP address as a command-line argument:
    ```bash
    ./client 192.168.1.15
+
+## Demo
+
+See the full walkthrough of XDoc:
+
+[XDoc-DemoVideo.mp4](https://github.com/user-attachments/assets/7a396592-04cb-43c7-b24d-7d137f387724)
